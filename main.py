@@ -11,16 +11,16 @@ if __name__ == '__main__':
     print(args)
 
     if len(sys.argv) < 2:
-        print('Please set mode of HandyRL.')
+        print('Please set mode.')
         exit(1)
 
     mode = sys.argv[1]
 
     if mode == '--train' or mode == '-t':
-        from handyrl.train import train_main as main
+        from src.train import train_main as main
         main(args)
     elif mode == '--eval' or mode == '-e':
-        from handyrl.evaluation import eval_main as main
+        from src.evaluation import eval_main as main
         main(args, sys.argv[2:])
     else:
         print('Not found mode %s.' % mode)
