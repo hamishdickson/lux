@@ -17,71 +17,59 @@ import timm
 
 # You need to install kaggle_environments, requests
 # from kaggle_environments import make
-import random
-from stable_baselines3 import PPO  # pip install stable-baselines3
-from luxai2021.env.lux_env import LuxEnvironment, SaveReplayAndModelCallback
-from luxai2021.env.agent import Agent, AgentWithModel
 from luxai2021.game.game import Game
 from luxai2021.game.actions import *
 from luxai2021.game.constants import LuxMatchConfigs_Default
-from functools import partial  # pip install functools
-# import numpy as np
-from gym import spaces
-import time
-import sys
-
 
 from .environment import BaseEnvironment
 
-class Constants:
-    class INPUT_CONSTANTS:
-        RESEARCH_POINTS = "rp"
-        RESOURCES = "r"
-        UNITS = "u"
-        CITY = "c"
-        CITY_TILES = "ct"
-        ROADS = "ccd"
-        DONE = "D_DONE"
-    class DIRECTIONS:
-        NORTH = "n"
-        WEST = "w"
-        SOUTH = "s"
-        EAST = "e"
-        CENTER = "c"
-    class UNIT_TYPES:
-        WORKER = 0
-        CART = 1
-    class RESOURCE_TYPES:
-        WOOD = "wood"
-        URANIUM = "uranium"
-        COAL = "coal"
+
+
+class BasicConv2d(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_size, bn):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            input_dim, output_dim, 
+            kernel_size=kernel_size, 
+            padding=(kernel_size[0] // 2, kernel_size[1] // 2)
+        )
+        self.bn = nn.BatchNorm2d(output_dim) if bn else None
+
+    def forward(self, x):
+        h = self.conv(x)
+        h = self.bn(h) if self.bn is not None else h
+        return h
 
 
 class LuxNet(nn.Module):
     def __init__(self):
         super().__init__()
         layers, filters = 12, 32
+        self.conv0 = BasicConv2d(20, filters, (3, 3), True)
+        self.blocks = nn.ModuleList([BasicConv2d(filters, filters, (3, 3), True) for _ in range(layers)])
+        self.head_p = nn.Linear(filters, 5, bias=False)
 
-        self.head_p = nn.Linear(filters, 4, bias=False)
-        self.head_v = nn.Linear(filters * 2, 1, bias=False)
-
-    def forward(self, x, _=None):
-        return {'policy': p, 'value': v}
+    def forward(self, x):
+        h = F.relu_(self.conv0(x))
+        for block in self.blocks:
+            h = F.relu_(h + block(h))
+        h_head = (h * x[:,:1]).view(h.size(0), h.size(1), -1).sum(-1)
+        p = self.head_p(h_head)
+        return p
 
 
 class Environment(BaseEnvironment):
-
     def __init__(self, args={}):
         super().__init__()
-        self.config = LuxMatchConfigs_Default
-        self.env = None
+        configs = LuxMatchConfigs_Default
+        self.env = Game(configs)
+        self.ACTION = [Constants.DIRECTIONS.CENTER, Constants.DIRECTIONS.NORTH, Constants.DIRECTIONS.EAST, Constants.DIRECTIONS.SOUTH, Constants.DIRECTIONS.WEST]
         self.reset()
 
     def reset(self, args={}):
-
-        # print("*******", self.env.configuration)
-        obs = self.env.reset()
-        print(obs)
+        obs = self.env.to_state_object()
+        obs['status'] = 'OVER' if self.env.match_over() else 'ACTIVE'
+        self.env.reset()
         self.update((obs, {}), True)
 
     def update(self, info, reset):
@@ -97,15 +85,6 @@ class Environment(BaseEnvironment):
     def str2action(self, s, player=None):
         return self.ACTION.index(s)
 
-    def direction(self, pos_from, pos_to):
-        if pos_from is None or pos_to is None:
-            return None
-        x, y = pos_from // 11, pos_from % 11
-        for i, d in enumerate(self.DIRECTION):
-            nx, ny = (x + d[0]) % 7, (y + d[1]) % 11
-            if nx * 11 + ny == pos_to:
-                return i
-        return None
 
     def __str__(self):
         # output state
@@ -122,28 +101,25 @@ class Environment(BaseEnvironment):
 
     def turns(self):
         # players to move
-        return [p for p in self.players() if self.obs_list[-1][p]['status'] == 'ACTIVE']
+        return [p for p in self.players()]
 
     def terminal(self):
-        # check whether terminal state or not
-        for obs in self.obs_list[-1]:
-            if obs['status'] == 'ACTIVE':
-                return False
+        if self.obs_list[-1]['status'] == 'ACTIVE':
+            return False
         return True
 
     def outcome(self):
         # return terminal outcomes
-        # 1st: 1.0 2nd: 0.33 3rd: -0.33 4th: -1.00
-        # print(self.obs_list)
         rewards = {o['observation']['player']: o['reward'] for o in self.obs_list[-1]}
         outcomes = {p: 0 for p in self.players()}
-        for p, r in rewards.items():
-            for pp, rr in rewards.items():
-                if p != pp:
-                    if r > rr:
-                        outcomes[p] += 1 / (self.NUM_AGENTS - 1)
-                    elif r < rr:
-                        outcomes[p] -= 1 / (self.NUM_AGENTS - 1)
+        outcomes[0] = 1.0 if rewards[0] > rewards[1] else -1.0
+        outcomes[1] = 1.0 if rewards[1] > rewards[0] else -1.0
+
+        # tie break
+        if rewards[0] == rewards[1]:
+            outcomes[0] = 0.0
+            outcomes[1] = 0.0
+
         return outcomes
 
     def legal_actions(self, player):
@@ -155,17 +131,7 @@ class Environment(BaseEnvironment):
         return len(self.ACTION)
 
     def players(self):
-        return list(range(self.NUM_AGENTS))
-
-    def rule_based_action(self, player):
-        from kaggle_environments.envs.hungry_geese.hungry_geese import Observation, Configuration, Action, GreedyAgent
-        action_map = {'N': Action.NORTH, 'S': Action.SOUTH, 'W': Action.WEST, 'E': Action.EAST}
-
-        agent = GreedyAgent(Configuration({'rows': 7, 'columns': 11}))
-        agent.last_action = action_map[self.ACTION[self.last_actions[player]][0]] if player in self.last_actions else None
-        obs = {**self.obs_list[-1][0]['observation'], **self.obs_list[-1][player]['observation']}
-        action = agent(Observation(obs))
-        return self.ACTION.index(action)
+        return [0, 1]
 
     def net(self):
         return LuxNet
@@ -176,7 +142,8 @@ class Environment(BaseEnvironment):
             player = 0
         
         obs = self.obs_list[-1][0]['observation']
-        b = np.zeros((obs['width'], obs['height'], NUM_STATES), dtype=np.float32)
+        # biggest board is 32,32 so build that and mask out unused area when smaller
+        b = np.zeros((32, 32, NUM_STATES), dtype=np.float32)
 
         # print(obs)
 
